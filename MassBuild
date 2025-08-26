@@ -27,6 +27,7 @@ CSV_PATH = "quantiles.csv"
 OUTPUT_DIR = "."
 STEP_SIZE = "50 MB"
 GENWEIGHT_MAX = 1e6
+OUTLIER_RATIO = 100.0  # drop if |genWeight| > OUTLIER_RATIO * median(|genWeight|) in sample
 
 CONFIG = {
     "objects": {
@@ -74,6 +75,37 @@ def process_sample(sample_name, files, thresholds, base_pt_cut, output_path):
     
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     
+    # Branches to load per chunk
+    branches = [
+        "ak8_pt", "ak8_eta", "ak8_phi", "ak8_msd",
+        "ak8_probRawHbb", "genWeight"
+    ]
+
+    # ---------- Pass 1: compute sample median of |genWeight| (after GENWEIGHT_MAX filter)
+    abs_genw_values = []
+    total_seen_events = 0
+    for file_uri in files:
+        try:
+            with uproot.open(file_uri) as rf:
+                tree = rf[TREE]
+                for arrays in tree.iterate(expressions=branches, step_size=STEP_SIZE, library="ak"):
+                    genw = ak.to_numpy(arrays["genWeight"]).astype(np.float64, copy=False)
+                    valid_mask = np.abs(genw) <= GENWEIGHT_MAX
+                    genw_valid = np.abs(genw[valid_mask])
+                    if genw_valid.size:
+                        abs_genw_values.append(genw_valid)
+                        total_seen_events += genw_valid.size
+        except Exception:
+            continue
+    if abs_genw_values:
+        median_abs_genw = float(np.median(np.concatenate(abs_genw_values)))
+    else:
+        median_abs_genw = 0.0
+    # Guard against zero median (e.g., all zeros); in that case, skip outlier filtering
+    apply_outlier_filter = median_abs_genw > 0.0
+    outlier_threshold = OUTLIER_RATIO * median_abs_genw if apply_outlier_filter else None
+
+    # ---------- Pass 2: write filtered outputs
     with uproot.recreate(output_path) as fout:
         writers = {
             label: fout.mktree(label, {"mass": np.float32, "genw": np.float32})
@@ -82,37 +114,42 @@ def process_sample(sample_name, files, thresholds, base_pt_cut, output_path):
         
         sumw_total = 0.0
         n_total = 0
-        n_filtered = 0
-        
-        branches = ["ak8_pt", "ak8_eta", "ak8_phi", "ak8_msd", 
-                   "ak8_probRawHbb", "genWeight"]
+        n_filtered_genmax = 0
+        n_filtered_outlier = 0
         
         for i, file_uri in enumerate(files, 1):
             file_sumw = 0.0
             file_events = 0
-            file_filtered = 0
+            file_f_genmax = 0
+            file_f_outlier = 0
             
             try:
                 with uproot.open(file_uri) as rf:
                     tree = rf[TREE]
                     
-                    for arrays in tree.iterate(expressions=branches, 
-                                              step_size=STEP_SIZE, 
-                                              library="ak"):
-                        
-                        genw = ak.to_numpy(arrays["genWeight"])
+                    for arrays in tree.iterate(expressions=branches, step_size=STEP_SIZE, library="ak"):
+                        genw = ak.to_numpy(arrays["genWeight"]).astype(np.float64, copy=False)
                         valid_mask = np.abs(genw) <= GENWEIGHT_MAX
-                        file_filtered += np.sum(~valid_mask)
+                        file_f_genmax += int(np.sum(~valid_mask))
+                        
+                        # Apply GENWEIGHT_MAX filter to all arrays first
                         for key in arrays.fields:
                             arrays[key] = arrays[key][valid_mask]
                         genw = genw[valid_mask]
                         
-                        file_sumw += float(np.sum(genw))
-                        file_events += len(genw)
-                        sumw_total += file_sumw
-                        n_total += file_events
-                        n_filtered += file_filtered
+                        # Apply outlier filter relative to sample median
+                        if apply_outlier_filter:
+                            out_mask = np.abs(genw) <= outlier_threshold
+                            file_f_outlier += int(np.sum(~out_mask))
+                            for key in arrays.fields:
+                                arrays[key] = arrays[key][out_mask]
+                            genw = genw[out_mask]
                         
+                        # Update per-file aggregates
+                        file_sumw += float(np.sum(genw))
+                        file_events += int(len(genw))
+                        
+                        # Build jets and apply selections
                         jets = ak.zip({
                             "pt": arrays["ak8_pt"],
                             "eta": arrays["ak8_eta"],
@@ -130,32 +167,34 @@ def process_sample(sample_name, files, thresholds, base_pt_cut, output_path):
                         for label, threshold in thresholds:
                             selected_jets = jets[id_score > threshold]
                             evt_mask = ak.num(selected_jets) >= 2
-                            
                             if not ak.any(evt_mask):
                                 continue
-                            
                             selected_jets = selected_jets[evt_mask]
-                            sorted_jets = selected_jets[ak.argsort(selected_jets.pt, 
-                                                                  axis=1, 
-                                                                  ascending=False)]
+                            sorted_jets = selected_jets[ak.argsort(selected_jets.pt, axis=1, ascending=False)]
                             jet1 = sorted_jets[:, 0]
                             jet2 = sorted_jets[:, 1]
-                            
                             mass = (jet1 + jet2).mass
                             mass_array = ak.to_numpy(mass).astype(np.float32)
                             genw_array = genw[evt_mask].astype(np.float32)
-                            
                             writers[label].extend({
                                 "mass": mass_array,
                                 "genw": genw_array
                             })
                 
                 file_name = file_uri.split("/")[-1]
-                if file_filtered > 0:
-                    print(f"  [{i}/{len(files)}] {file_name}: events={file_events}, filtered={file_filtered}, sumw={file_sumw:.2e}")
-                else:
-                    print(f"  [{i}/{len(files)}] {file_name}: events={file_events}, sumw={file_sumw:.2e}")
-                    
+                msg = f"  [{i}/{len(files)}] {file_name}: events={file_events}, sumw={file_sumw:.2e}"
+                if file_f_genmax > 0:
+                    msg += f", filtered_genmax={file_f_genmax}"
+                if file_f_outlier > 0:
+                    msg += f", filtered_outlier={file_f_outlier}"
+                print(msg)
+                
+                # Update sample totals once per file
+                sumw_total += file_sumw
+                n_total += file_events
+                n_filtered_genmax += file_f_genmax
+                n_filtered_outlier += file_f_outlier
+                
             except Exception as e:
                 file_name = file_uri.split("/")[-1]
                 print(f"  [{i}/{len(files)}] {file_name}: ERROR - {e}")
@@ -164,16 +203,20 @@ def process_sample(sample_name, files, thresholds, base_pt_cut, output_path):
         fout["meta"] = {"sumw_total": np.array([sumw_total], dtype=np.float64)}
         
         print(f"\n[SUMMARY] {sample_name}:")
-        if n_filtered > 0:
-            print(f"  - Filtered {n_filtered} events with |genWeight| > {GENWEIGHT_MAX}")
+        if n_filtered_genmax > 0:
+            print(f"  - Filtered {n_filtered_genmax} events with |genWeight| > {GENWEIGHT_MAX}")
+        if apply_outlier_filter and n_filtered_outlier > 0:
+            print(f"  - Filtered {n_filtered_outlier} events with |genWeight|/median > {OUTLIER_RATIO:.0f} (median|w|={median_abs_genw:.3g})")
+        elif not apply_outlier_filter:
+            print("  - Outlier filter skipped (median |genWeight| is 0)")
         print(f"  - Valid events: {n_total}")
         print(f"  - Total sumw: {sumw_total:.6g}")
     
     print(f"[INFO] Saved to: {os.path.abspath(output_path)}")
 
 print("="*60)
-print(f"Starting mass calculation with genWeight filtering")
-print(f"Max |genWeight| = {GENWEIGHT_MAX}")
+print(f"Starting mass calculation with genWeight filtering and outlier suppression")
+print(f"Max |genWeight| = {GENWEIGHT_MAX}, outlier ratio = {OUTLIER_RATIO}x median |w|")
 print("="*60)
 
 csv_data = read_csv_thresholds(CSV_PATH)
